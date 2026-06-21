@@ -1,0 +1,182 @@
+This folder holds arduino code
+
+
+/* =========================================================
+   AUTOMATED SMART EGG INCUBATOR – ARDUINO UNO R3
+   ========================================================= */
+
+#include <DHT.h>
+#include <LiquidCrystal_I2C.h>
+#include <SoftwareSerial.h>
+
+/* ----------- PIN DEFINITIONS ----------- */
+#define DHTPIN 2
+#define DHTTYPE DHT22
+
+#define HEATER_RELAY 3
+#define FAN_RELAY 4
+#define HUMIDIFIER_RELAY 5
+#define TRAY_MOTOR_RELAY 6
+#define CANDLE_LED 7
+#define POWER_SENSE 8
+#define BATTERY_RELAY 9
+
+#define GSM_RX 10
+#define GSM_TX 11
+
+/* ----------- OBJECT DECLARATIONS ----------- */
+DHT dht(DHTPIN, DHTTYPE);
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+SoftwareSerial gsm(GSM_RX, GSM_TX);
+
+/* ----------- SET POINTS ----------- */
+float TEMP_SET = 37.5;      // °C
+float TEMP_MAX = 38.5;
+float HUM_SET  = 60.0;      // %
+
+/* ----------- TIMER VARIABLES ----------- */
+unsigned long lastTurnTime = 0;
+unsigned long trayInterval = 4UL * 60UL * 60UL * 1000UL; // every 4 hours
+unsigned long turnDuration = 5000; // 5 seconds
+
+unsigned long lastCandleTime = 0;
+unsigned long candleInterval = 24UL * 60UL * 60UL * 1000UL;
+
+/* ----------- SENSOR VARIABLES ----------- */
+float temperature = 0;
+float humidity = 0;
+
+/* =========================================================
+   SETUP FUNCTION
+   ========================================================= */
+void setup() {
+
+  pinMode(HEATER_RELAY, OUTPUT);
+  pinMode(FAN_RELAY, OUTPUT);
+  pinMode(HUMIDIFIER_RELAY, OUTPUT);
+  pinMode(TRAY_MOTOR_RELAY, OUTPUT);
+  pinMode(CANDLE_LED, OUTPUT);
+  pinMode(POWER_SENSE, INPUT);
+  pinMode(BATTERY_RELAY, OUTPUT);
+
+  digitalWrite(HEATER_RELAY, LOW);
+  digitalWrite(FAN_RELAY, LOW);
+  digitalWrite(HUMIDIFIER_RELAY, LOW);
+  digitalWrite(TRAY_MOTOR_RELAY, LOW);
+  digitalWrite(CANDLE_LED, LOW);
+
+  Serial.begin(9600);
+  gsm.begin(9600);
+
+  dht.begin();
+  lcd.init();
+  lcd.backlight();
+
+  lcd.setCursor(0, 0);
+  lcd.println("Smart Incubator");
+  lcd.setCursor(0, 1);
+  lcd.println("Initializing…");
+  delay(2000);
+
+  // Read initial values
+  temperature = dht.readTemperature();
+  humidity = dht.readHumidity();
+
+  lcd.clear();
+}
+
+/* =========================================================
+   GSM SMS FUNCTION
+   ========================================================= */
+void sendSMS(String message) {
+  gsm.println("AT+CMGF=1");
+  delay(1000);
+  gsm.println("AT+CMGS=\"+256768718707\"");
+  delay(1000);
+  gsm.print(message);
+  delay(1000);
+  gsm.write(26); // CTRL+Z
+  delay(2000);
+}
+
+/* =========================================================
+   MAIN LOOP
+   ========================================================= */
+void loop() {
+
+  /* ----------- READ SENSORS ----------- */
+  temperature = dht.readTemperature();
+  humidity = dht.readHumidity();
+
+  /* ----------- TEMPERATURE CONTROL ----------- */
+  if (temperature < TEMP_SET) {
+    digitalWrite(HEATER_RELAY, HIGH);
+    digitalWrite(FAN_RELAY, LOW);
+  }
+  else if (temperature > TEMP_MAX) {
+    digitalWrite(HEATER_RELAY, LOW);
+    digitalWrite(FAN_RELAY, HIGH);
+  }
+  else {
+    digitalWrite(FAN_RELAY, LOW);
+  }
+
+  /* ----------- HUMIDITY CONTROL ----------- */
+  if (humidity < HUM_SET) {
+    digitalWrite(HUMIDIFIER_RELAY, HIGH);
+  } else {
+    digitalWrite(HUMIDIFIER_RELAY, LOW);
+  }
+
+  /* ----------- TRAY TURNING CONTROL ----------- */
+  if (millis() - lastTurnTime >= trayInterval) {
+    digitalWrite(TRAY_MOTOR_RELAY, HIGH);
+    delay(turnDuration);
+    digitalWrite(TRAY_MOTOR_RELAY, LOW);
+    lastTurnTime = millis();
+  }
+
+  /* ----------- CANDLING CONTROL ----------- */
+  if (millis() -lastCandleTime >= candleInterval) {
+    digitalWrite(CANDLE_LED, HIGH);
+    delay(10000); // candling ON for 10 seconds
+    digitalWrite(CANDLE_LED, LOW);
+    lastCandleTime = millis();
+  }
+
+  /* ----------- POWER MONITORING ----------- */
+  if (digitalRead(POWER_SENSE) == LOW) {
+    digitalWrite(BATTERY_RELAY, HIGH);
+    sendSMS("Main power OFF. Switched to battery backup.");
+  } else {
+    digitalWrite(BATTERY_RELAY, LOW);
+  }
+
+  /* ----------- ALERT CONDITIONS ----------- */
+  if (temperature < 35 || temperature > 39) {
+    sendSMS("Warning: Temperature out of safe range!");
+  }
+
+  if (humidity < 45 || humidity > 75) {
+    sendSMS("Warning: Humidity out of safe range!");
+  }
+
+  /* ----------- LCD DISPLAY UPDATE ----------- */
+  lcd.setCursor(0, 0);
+  lcd.print("T:");
+  lcd.print(temperature);
+  lcd.print("CH:");
+  lcd.print(humidity);
+  lcd.print("%");
+
+  lcd.setCursor(0, 1);
+  if (digitalRead(POWER_SENSE) == HIGH)
+    lcd.print("Power: MAINS ");
+  else
+    lcd.print("Power: BATTERY");
+
+  delay(2000);
+}
+
+
+

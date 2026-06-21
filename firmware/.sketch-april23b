@@ -1,0 +1,367 @@
+/* =========================================================
+   AUTOMATED SMART EGG INCUBATOR – PRODUCTION
+   Arduino UNO R3 + SIM800L + DHT22 + I2C LCD
+   ========================================================= */
+
+#include <DHT.h>
+#include <LiquidCrystal_I2C.h>
+#include <SoftwareSerial.h>
+
+/* ----------- PIN DEFINITIONS ----------- */
+#define DHTPIN 2
+#define DHTTYPE DHT22
+
+#define HEATER_RELAY 3
+#define FAN_RELAY 4
+#define HUMIDIFIER_RELAY 5
+#define TRAY_MOTOR_RELAY 6
+#define CANDLE_LED 7
+#define POWER_SENSE 8  // LOW = power fail, HIGH = mains OK
+
+#define GSM_RX 10  // Uno RX <- SIM800L TX
+#define GSM_TX 11  // Uno TX -> SIM800L RX
+
+bool sendSMS(String message);
+bool waitForResponse(String keyword,unsigned int timeout);
+
+/* ----------- OBJECTS ----------- */
+DHT dht(DHTPIN, DHTTYPE);
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+SoftwareSerial gsm(GSM_RX, GSM_TX);
+
+/* ----------- SET POINTS ----------- */
+const float TEMP_SET = 35.5;
+const float TEMP_MAX = 38.5;
+const float HUM_SET  = 60.0;
+
+/* ----------- TIMERS ----------- */
+unsigned long lastTurnTime = 0;
+const unsigned long trayInterval = 4UL * 60UL * 1000UL; // Every 4 hours
+const unsigned long turnDuration = 5000; // 5 seconds
+
+unsigned long lastCandleTime = 0;
+const unsigned long candleInterval = 24UL * 60UL * 1000UL; // Once per day
+
+unsigned long lastSMS = 0;
+const unsigned long smsCooldown = 10UL * 60UL * 1000UL; // 10 min between alerts
+
+/* ----------- VARIABLES ----------- */
+float temperature = 0;
+float humidity = 0;
+
+/* ----------- FLAGS ----------- */
+bool gsmReady = false;
+bool powerAlertSent = false;
+bool tempAlertSent = false;
+bool humAlertSent = false;
+
+/* =========================================================
+   SETUP
+   ========================================================= */
+void setup() {
+  Serial.begin(9600);
+  delay(1000);
+  Serial.println(F("Smart Incubator Booting"));
+
+
+  pinMode(HEATER_RELAY, OUTPUT);
+  pinMode(FAN_RELAY, OUTPUT);
+  pinMode(HUMIDIFIER_RELAY, OUTPUT);
+  pinMode(TRAY_MOTOR_RELAY, OUTPUT);
+  pinMode(CANDLE_LED, OUTPUT);
+  pinMode(POWER_SENSE, INPUT_PULLUP); // LOW when mains fails
+
+  digitalWrite(HEATER_RELAY, LOW);
+  digitalWrite(FAN_RELAY, LOW);
+  digitalWrite(HUMIDIFIER_RELAY, LOW);
+  digitalWrite(TRAY_MOTOR_RELAY, LOW);
+  digitalWrite(CANDLE_LED, LOW);
+
+  gsm.begin(9600);
+  delay(3000);
+  gsm.println("AT+CMGF =1");//sets SMS to text mode
+  delay(1000);
+  gsm.println("AT+CNMI=2,1,0,0,0");//store SMS dont autoread
+  delay(1000); 
+  gsm.println("AT+CPMS=\"SM\",\"SM\",\"SM\"");//Use SIMcard for SMS storage
+  delay(1000);
+  
+  delay(1000);
+  dht.begin();
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Smart Incubator");
+  lcd.setCursor(0, 1);
+  lcd.print("Starting GSM…");
+
+  // Wait for GSM network – 30s timeout
+  Serial.println(F("Waiting for GSM..."));
+  unsigned long start = millis();
+  while (millis() - start < 30000) {
+    gsm.println("AT");
+    delay(1000);
+    if (gsm.available()) {
+      String reply = gsm.readString();
+      if (reply.indexOf("Call Ready") != -1 || reply.indexOf("SMS Ready") != -1) {
+        gsmReady = true;
+        break;
+      }
+    }
+  }
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("System Ready");
+  lcd.setCursor(0, 1);
+  if (gsmReady) lcd.print("GSM: Online");
+  else lcd.print("GSM: Offline");
+  delay(2000);
+  lcd.clear();
+}
+
+/* =========================================================
+   LOOP
+   ========================================================= */
+void loop() {
+
+  /* ----------- READ DHT22 ----------- */
+  temperature = dht.readTemperature();
+  humidity = dht.readHumidity();
+
+  if (isnan(temperature) || isnan(humidity)) {
+    lcd.setCursor(0, 0);
+    lcd.print("DHT22 ERROR     ");
+    Serial.println(F("DHT22 ERROR"));
+    delay(2000);
+    return;
+  }
+
+  /* ----------- TEMPERATURE CONTROL ----------- */
+  if (temperature < TEMP_SET) {
+    digitalWrite(HEATER_RELAY, LOW);
+    digitalWrite(FAN_RELAY, HIGH);
+  }
+  else if (temperature > TEMP_MAX) {
+    digitalWrite(HEATER_RELAY, HIGH);
+    digitalWrite(FAN_RELAY, LOW);
+  }
+  else {
+    digitalWrite(HEATER_RELAY, LOW);
+    digitalWrite(FAN_RELAY, HIGH);
+  }
+
+  /* ----------- HUMIDITY CONTROL ----------- */
+  if (humidity < HUM_SET) {
+    digitalWrite(HUMIDIFIER_RELAY, HIGH);
+  } else {
+    digitalWrite(HUMIDIFIER_RELAY, LOW);
+  }
+
+  /* ----------- TRAY TURNING – EVERY 4 HOURS ----------- */
+  if (millis() - lastTurnTime >= trayInterval) {
+    Serial.println(F("Turning tray..."));
+    digitalWrite(TRAY_MOTOR_RELAY, HIGH);
+    delay(turnDuration);
+    digitalWrite(TRAY_MOTOR_RELAY, LOW);
+    lastTurnTime = millis();
+  }
+
+  /* ----------- CANDLING – ONCE PER DAY ----------- */
+  if (millis() - lastCandleTime >= candleInterval) {
+    Serial.println(F("Candling ON"));
+    digitalWrite(CANDLE_LED, HIGH);
+    delay(10000); // 10 seconds
+    digitalWrite(CANDLE_LED, LOW);
+    lastCandleTime = millis();
+  }
+
+  /* ----------- POWER FAIL DETECTION – SMS ONLY ----------- */
+  if (digitalRead(POWER_SENSE) == LOW && !powerAlertSent) {
+    Serial.println(F("Power failed!"));
+    if (gsmReady) sendSMS("INCUBATOR ALERT: Main power OFF.");
+    powerAlertSent = true;
+  } 
+  else if (digitalRead(POWER_SENSE) == HIGH && powerAlertSent) {
+    Serial.println(F("Power restored"));
+    if (gsmReady) sendSMS("INCUBATOR INFO: Main power restored.");
+    powerAlertSent = false;
+  }
+
+  /* ----------- TEMP/HUMIDITY ALERTS ----------- */
+  bool canSendSMS = (millis() - lastSMS > smsCooldown) && gsmReady;
+
+  if ((temperature < 35.0 || temperature > 39.0) && !tempAlertSent && canSendSMS) {
+    Serial.println(F("Temp critical!"));
+    sendSMS("WARNING: Temp critical! T=" + String(temperature, 1) + "C");
+    tempAlertSent = true;
+    lastSMS = millis();
+  }
+  else if (temperature >= 35.0 && temperature <= 39.0) {
+    tempAlertSent = false;
+  }
+
+  if ((humidity < 45.0 || humidity > 75.0) && !humAlertSent && canSendSMS) {
+    Serial.println(F("Humidity critical"));
+    sendSMS("WARNING: Humidity critical! H=" + String(humidity, 0) + "%");
+    humAlertSent = true;
+    lastSMS = millis();
+  }
+  else if (humidity >= 45.0 && humidity <= 75.0) {
+    humAlertSent = false;
+  }
+
+  /* ----------- LCD UPDATE ----------- */
+  lcd.setCursor(0, 0);
+  lcd.print("T:");
+  lcd.print(temperature, 1);
+  lcd.print("C H:");
+  lcd.print(humidity, 0);
+  lcd.print("%  ");
+
+  lcd.setCursor(0, 1);
+  if (digitalRead(POWER_SENSE) == HIGH) {
+    lcd.print("Power: MAINS   ");
+  } else {
+    lcd.print("Power: BATTERY    ");
+  }
+
+ //SERIAL DEBUG OUTPUT
+ Serial.print(F("T"));Serial.print(temperature,1);
+ Serial.print(F("C H:"));Serial.print(humidity,0);
+ Serial.print(F("% Power"));
+ Serial.print(digitalRead(POWER_SENSE)==HIGH? F("MAINS") :F("BATTERY"));
+ Serial.print(F(" GSM:"));Serial.println(gsmReady? F("OK") :F("NO"));
+
+ //Check for incoming SMS every 10 seconds
+ static unsigned long lastSMSCheck = 0;
+ if(millis()-lastSMSCheck> 10000) {
+  if(gsmReady) checkIncomingSMS();
+  lastSMSCheck =millis();
+ }
+ if(gsmReady)handleSMS();
+ delay(2000);
+}
+
+void handleSMS() {
+  gsm.println("AT+CMGF=1"); // Force text mode
+  delay(100);
+  gsm.println("AT+CMGL=\"REC UNREAD\"");
+  
+  String data = "";
+  long t = millis();
+  while (millis() - t < 2000) {
+    while (gsm.available()) data += (char)gsm.read();
+  }
+  
+  if (data.indexOf("+CMGL:") != -1) {
+    data.toUpperCase();
+    if (data.indexOf("STATUS") != -1 || data.indexOf("?") != -1) {
+      String msg = "T:" + String(temperature,1) + "C H:" + String(humidity,0) + "% ";
+      msg += "Power:" + String(digitalRead(POWER_SENSE)==HIGH?"MAINS":"FAIL");
+      
+      gsm.println("AT+CMGF=1");
+      delay(100);
+      gsm.print("AT+CMGS=\"+256768718707\"");
+      gsm.println();
+      delay(1000);
+      gsm.print(msg);
+      gsm.write(26);
+      delay(5000);
+    }
+    gsm.println("AT+CMGD=1,4"); // Delete SMS
+  }
+}
+
+
+
+/* =========================================================
+   SEND SMS – ONLY WHEN GSM READY
+   ========================================================= */
+  bool sendSMS(String message) {
+   if (!gsmReady) return false;{
+    Serial.println(F("SMS skipped:GSM not ready"));
+    return false;
+   }
+
+    Serial.println("Sending SMS:"+ message);
+  
+    gsm.println("AT+CMGF=1");
+    if (!waitForResponse("OK", 2000)){
+      Serial.println(F("SMS Error:AT+CMGF failed"));
+      return false;
+   }
+  
+   gsm.print("AT+CMGS=\"+256768718707\""); 
+   gsm.println();
+   if (!waitForResponse(">", 5000)){
+     Serial.println(F("SMS Error:No prompt"));
+     return false;
+    }
+  
+   gsm.print(message);
+   gsm.write(26);
+ 
+   if(waitForResponse("+CMGS:",10000)){
+     Serial.println(F("SMS sent"));
+     return true;
+    } else{
+    Serial.println(F("SMS failed"));
+    return false;
+  }
+
+}
+/* =========================================================
+   WAIT FOR GSM RESPONSE
+  ========================================================= */
+  bool waitForResponse(String keyword, unsigned int timeout) {
+    void checkIncomingSms();
+    String response = "";
+    unsigned long start = millis();
+    while (millis() - start < timeout) {
+     while (gsm.available()) {
+      char c= gsm.read();
+      Serial.write(c);
+      response += c;
+    }
+    if (response.indexOf(keyword) != -1) return true;
+  }
+   return false;
+}
+
+/*=============================================================
+CHECK FOR INCOMING SMS AND REPLY
+===============================================================*/
+void checkIncomingSMS() {
+  gsm.println("AT+CMGL=\"REC UNREAD\"");//List all unread SMS
+  if(waitForResponse("+CMGL:",3000)) {
+    String smsData ="";
+    unsigned long start =millis();
+    while(millis()- start <2000) {
+      while (gsm.available()) {
+        char c = gsm.read();
+        smsData +=c;
+      }
+    }
+
+    //if sms contains STATUS, UPDATE,or ?send back data
+    smsData.toUpperCase();
+    if(smsData.indexOf("STATUS")!=-1||smsData.indexOf("UPDATE")!=-1||smsData.indexOf("?")!=-1) {
+      String reply ="Incubator Status:\n";
+      reply += "T:" +String(temperature,1)+ "C\n";
+      reply += "H:" +String(humidity,0)+ "%\n";
+      reply += "Power:"+String(digitalRead(POWER_SENSE)==HIGH? "MAINS": "BATTERY")+ "\n";
+      reply += "Heater:" +String(digitalRead(HEATER_RELAY)==HIGH? "ON" : "OFF")+"\n";
+      reply += "Fan:" +String(digitalRead(FAN_RELAY)==HIGH? "ON" : "OFF")+"\n";
+      reply += "Humid:" +String(digitalRead(HUMIDIFIER_RELAY)==HIGH? "ON" : "OFF")+"\n";
+
+      sendSMS(reply);
+      Serial.println(F("Sent status reply via SMS"));
+    }
+
+    //Delete all read sms to save sim memory
+    gsm.println("AT+CMGD=1,4");
+    waitForResponse("OK",1000);
+  }
+}
+

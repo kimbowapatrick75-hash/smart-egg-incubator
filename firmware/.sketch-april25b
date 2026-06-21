@@ -1,0 +1,366 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <DHT.h>
+#include <SoftwareSerial.h>
+
+// ====== CONFIG – CHANGE THIS ======
+#define MY_PHONE "+256768718707" // PHONE NUMBER HERE WITH +256
+#define DHTPIN 2
+#define DHTTYPE DHT22
+#define HEATER_RELAY 3
+#define HUMIDIFIER_RELAY 4
+#define POWER_SENSE 5
+#define TRAY_MOTOR_RELAY 6
+#define CANDLING_LIGHT 9
+#define RX_PIN 10 // SIM800L TXD -> Arduino Pin 10 – CHANGED
+#define TX_PIN 11 // SIM800L RXD -> Arduino Pin 11 – CHANGED
+// ==================================
+
+// === CONTROL PARAMETERS – WIDE RANGE FOR LESS SWITCHING ===
+#define TEMP_HYST 1.5 // Heater ON at 35.0, OFF at 38.0 if tempSet=36.5
+#define HUM_HYST 3.0
+#define TEMP_MAX_SAFETY 40.0
+#define TEMP_MIN_HUMID 30.0
+#define HUM_READINGS 3
+
+DHT dht(DHTPIN, DHTTYPE);
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+SoftwareSerial gsm(RX_PIN, TX_PIN);
+
+float temperature = 0;
+float humidity = 0;
+float tempSet = 36.5; // CENTER OF 35-38 RANGE
+float humSet = 60.0;
+bool gsmReady = false;
+bool powerFailSent = false;
+bool tempHighSent = false;
+bool tempLowSent = false;
+
+float humBuffer[HUM_READINGS];
+int humIndex = 0;
+
+unsigned long lastTrayTurn = 0;
+const unsigned long TRAY_INTERVAL = 3600000;
+const unsigned long TRAY_DURATION = 15000;
+bool trayMotorRunning = false;
+unsigned long trayStartTime = 0;
+
+bool waitForResponse(String expected, unsigned int timeout) {
+  long start = millis();
+  String response = "";
+  while (millis() - start < timeout) {
+    while (gsm.available()) {
+      char c = gsm.read();
+      response += c;
+    }
+    if (response.indexOf(expected)!= -1) return true;
+  }
+  return false;
+}
+
+void sendSMS(String number,String message) {
+  if (!gsmReady) {
+    Serial.println(F("SMS Failed: GSM not ready"));
+    return;
+  }
+
+  Serial.print(F("Sending to "));
+  Serial.print(number);
+  Serial.print(F(": "));
+  Serial.println(message);
+
+  gsm.println("AT+CMGF=1");
+  delay(300);
+  gsm.flush();
+
+  gsm.print("AT+CMGS=\"");
+  gsm.print(number);
+  gsm.println("\"");
+  delay(1000);
+
+  gsm.print(message);
+  delay(300);
+  gsm.write(26);
+
+  long t = millis();
+  String response = "";
+  while (millis() - t < 10000) {
+    while (gsm.available()) {
+      char c = gsm.read();
+      Serial.write(c);
+      response += c;
+    }
+    if (response.indexOf("OK")!= -1 || response.indexOf("ERROR")!= -1) break;
+  }
+
+  if (response.indexOf("+CMGS:")!= -1) {
+    Serial.println(F("SMS Sent OK"));
+  } else {
+    Serial.println(F("SMS Failed - Check power/airtime"));
+  }
+}
+
+void turnTray() {
+  Serial.println(F("Turning tray…"));
+  digitalWrite(TRAY_MOTOR_RELAY, LOW);
+  trayMotorRunning = true;
+  trayStartTime = millis();
+}
+
+float getAvgHumidity() {
+  float sum = 0;
+  for (int i = 0; i < HUM_READINGS; i++) {
+    sum += humBuffer[i];
+  }
+  return sum / HUM_READINGS;
+}
+
+void checkIncomingSMS() {
+  gsm.println("AT+CMGF=1");
+  delay(100);
+
+  gsm.println("AT+CMGL=\"REC UNREAD\"");
+  String buffer = "";
+  long start = millis();
+  while (millis() - start < 2000) {
+    while (gsm.available()) {
+      char c = gsm.read();
+      buffer += c;
+    }
+  }
+
+  if (buffer.indexOf("+CMGL:") == -1) return;
+
+  Serial.println(F("=== SMS RECEIVED ==="));
+  Serial.println(buffer);
+  Serial.println(F("=================="));
+
+  int numStart = buffer.indexOf("\",\"") + 3;
+  int numEnd = buffer.indexOf("\",\"", numStart);
+  String sender = MY_PHONE;
+  if (numStart > 2 && numEnd > numStart) {
+    sender = buffer.substring(numStart, numEnd);
+  }
+
+  Serial.print(F("From: "));
+  Serial.println(sender);
+
+  String upperBuffer = buffer;
+  upperBuffer.toUpperCase();
+
+  if (upperBuffer.indexOf("STATUS")!= -1 || upperBuffer.indexOf("?")!= -1 ||
+      upperBuffer.indexOf("TEMP")!= -1 || upperBuffer.indexOf("UPDATE")!= -1) {
+
+    String reply ="Incubator:\n";
+    reply += "T:" + String(temperature, 1) + "C Range 35-38C\n";
+    reply += "H:" + String(getAvgHumidity(), 0) + "%/" + String(humSet, 0) + "%\n";
+    reply += "Pwr:" + String(digitalRead(POWER_SENSE)==LOW? "MAINS" : "FAIL") + "\n";
+    reply += "Heat:" + String(digitalRead(HEATER_RELAY)==LOW? "ON" : "OFF") + "\n";
+    reply += "Hum:" + String(digitalRead(HUMIDIFIER_RELAY)==LOW? "ON" : "OFF") + "\n";
+    reply += "Tray:" + String(millis() - lastTrayTurn < TRAY_INTERVAL? "OK" : "DUE");
+
+    sendSMS(sender, reply);
+  }
+  else if (upperBuffer.indexOf("TURN")!= -1) {
+    turnTray();
+    sendSMS(sender, "Tray turning now");
+  }
+  else if (upperBuffer.indexOf("CANDLE ON")!= -1 || upperBuffer.indexOf("LIGHT ON")!= -1) {
+    digitalWrite(CANDLING_LIGHT, HIGH);
+    sendSMS(sender, "Candling light ON");
+  }
+  else if (upperBuffer.indexOf("CANDLE OFF")!= -1 || upperBuffer.indexOf("LIGHT OFF")!= -1) {
+    digitalWrite(CANDLING_LIGHT, LOW);
+    sendSMS(sender, "Candling light OFF");
+  }
+  else if (upperBuffer.indexOf("SET TEMP")!= -1) {
+    int valStart = upperBuffer.indexOf("SET TEMP") + 8;
+    float newTemp = upperBuffer.substring(valStart).toFloat();
+    if (newTemp >= 35.0 && newTemp <= 39.0) {
+      tempSet = newTemp;
+      sendSMS(sender, "Temp set to " + String(tempSet, 1) + "C");
+    } else {
+      sendSMS(sender, "Temp range: 35.0-39.0C");
+    }
+  }
+  else if (upperBuffer.indexOf("SET HUM")!= -1) {
+    int valStart = upperBuffer.indexOf("SET HUM") + 7;
+    float newHum = upperBuffer.substring(valStart).toFloat();
+    if (newHum >= 40 && newHum <= 80) {
+      humSet = newHum;
+      sendSMS(sender, "Hum set to " + String(humSet, 0) + "%");
+    } else {
+      sendSMS(sender, "Hum range: 40-80%");
+    }
+  }
+
+  gsm.println("AT+CMGD=1,4");
+  delay(1000);
+}
+
+void setup() {
+  Serial.begin(9600);
+  gsm.begin(9600);
+  delay(5000);
+
+  Serial.println(F("Incubator Starting…"));
+
+  dht.begin();
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Incubator Init");
+
+  pinMode(HEATER_RELAY, OUTPUT);
+  pinMode(HUMIDIFIER_RELAY, OUTPUT);
+  pinMode(POWER_SENSE, INPUT);
+  pinMode(TRAY_MOTOR_RELAY, OUTPUT);
+  pinMode(CANDLING_LIGHT, OUTPUT);
+  digitalWrite(HEATER_RELAY, LOW);
+  digitalWrite(HUMIDIFIER_RELAY, HIGH);
+  digitalWrite(TRAY_MOTOR_RELAY, HIGH);
+  digitalWrite(CANDLING_LIGHT, LOW);
+
+  for (int i = 0; i < HUM_READINGS; i++) {
+    humBuffer[i] = 50.0;
+  }
+
+  gsmReady = false;
+  gsm.println("AT");
+  if (!waitForResponse("OK", 3000)) {
+    Serial.println(F("GSM: Module not responding"));
+    lcd.setCursor(0, 1);
+    lcd.print("GSM: No Module");
+    return;
+  }
+
+  gsm.println("AT+CPIN?");
+  if (!waitForResponse("READY", 5000)) {
+    Serial.println(F("GSM: SIM error"));
+    lcd.setCursor(0, 1);
+    lcd.print("GSM: SIM Error");
+    return;
+  }
+
+  gsm.println("AT+CMEE=2");
+  waitForResponse("OK", 1000);
+  gsm.println("AT+CMGF=1");
+  waitForResponse("OK", 1000);
+  gsm.println("AT+CPMS=\"SM\",\"SM\",\"SM\"");
+  waitForResponse("OK", 1000);
+  gsm.println("AT+CNMI=2,1,0,0,0");
+  waitForResponse("OK", 1000);
+  gsm.println("AT+CMGD=1,4");
+  waitForResponse("OK", 1000);
+
+  Serial.println(F("Waiting for network…"));
+  lcd.setCursor(0, 1);
+  lcd.print("GSM: Searching");
+
+  for (int i = 0; i < 30; i++) {
+    gsm.println("AT+CREG?");
+    if (waitForResponse("+CREG: 0,1", 2000) || waitForResponse("+CREG: 0,5", 2000)) {
+      gsmReady = true;
+      Serial.println(F("GSM:OK"));
+      lcd.setCursor(0, 1);
+      lcd.print("GSM:Ready ");
+      delay(1000);
+      sendSMS(MY_PHONE, "Incubator Online");
+      break;
+    }
+    delay(1000);
+  }
+
+  if (!gsmReady) {
+    Serial.println(F("GSM: Failed to register"));
+    lcd.setCursor(0, 1);
+    lcd.print("GSM: No Network");
+  }
+
+  lastTrayTurn = millis();
+}
+
+void loop() {
+  float h = dht.readHumidity();
+  float t = dht.readTemperature();
+
+  if (isnan(h) || isnan(t)) {
+    Serial.println(F("DHT read failed"));
+    lcd.setCursor(0, 0);
+    lcd.print("Sensor Error ");
+    delay(2000);
+    return;
+  }
+
+  temperature = t;
+  humBuffer[humIndex] = h;
+  humIndex = (humIndex + 1) % HUM_READINGS;
+  humidity = getAvgHumidity();
+
+  lcd.setCursor(0, 0);
+  lcd.print("T:");
+  lcd.print(temperature, 1);
+  lcd.print("C  H:");
+  lcd.print(humidity, 0);
+  lcd.print("%");
+
+  lcd.setCursor(0, 1);
+  lcd.print("P:");
+  lcd.print(digitalRead(POWER_SENSE)==LOW? "M" : "F");
+  lcd.print(" H:");
+  lcd.print(digitalRead(HEATER_RELAY)==LOW? "ON" : "OFF");
+  lcd.print(" Hu:");
+  lcd.print(digitalRead(HUMIDIFIER_RELAY)==LOW? "ON" : "OF");
+
+  // === WIDE RANGE HEATER CONTROL: 35.0 to 38.0 ===
+  if (temperature < (tempSet - TEMP_HYST) && temperature < TEMP_MAX_SAFETY) {
+    digitalWrite(HEATER_RELAY, LOW);
+  } else if (temperature > (tempSet + TEMP_HYST)) {
+    digitalWrite(HEATER_RELAY, HIGH);
+  }
+
+  // === HUMIDIFIER CONTROL ===
+  if (humidity < (humSet - HUM_HYST) && temperature > TEMP_MIN_HUMID) {
+    digitalWrite(HUMIDIFIER_RELAY, LOW);
+  } else if (humidity > (humSet + HUM_HYST)) {
+    digitalWrite(HUMIDIFIER_RELAY, HIGH);
+  }
+
+  // === AUTO TRAY TURNING ===
+  if (!trayMotorRunning && millis() - lastTrayTurn >= TRAY_INTERVAL) {
+    turnTray();
+    
+  }
+
+  if (trayMotorRunning && millis() - trayStartTime >= TRAY_DURATION) {
+    digitalWrite(TRAY_MOTOR_RELAY, HIGH);
+    trayMotorRunning = false;
+    lastTrayTurn = millis();
+    Serial.println(F("Tray turn complete”"));
+
+  }
+
+  // === SMS ALERTS ===
+  if (digitalRead(POWER_SENSE) == HIGH &&!powerFailSent && gsmReady) {
+    sendSMS(MY_PHONE, "ALERT: POWER FAIL! Battery mode");
+    powerFailSent = true;
+  }
+  if (digitalRead(POWER_SENSE) == LOW) powerFailSent = false;
+
+  if (temperature > tempSet + 3.0 &&!tempHighSent && gsmReady) {
+    sendSMS(MY_PHONE, "ALERT: Temp HIGH! " + String(temperature,1) + "C");
+    tempHighSent = true;
+  }
+  if (temperature <= tempSet + 1.0) tempHighSent = false;
+
+  if (temperature < tempSet -3.0 &&!tempLowSent && gsmReady) {
+    sendSMS(MY_PHONE, "ALERT: Temp LOW! " + String(temperature,1) + "C");
+    tempLowSent = true;
+  }
+  if (temperature >= tempSet - 1.0) tempLowSent = false;
+
+  if (gsmReady) checkIncomingSMS();
+
+  delay(2000);
+}
+
